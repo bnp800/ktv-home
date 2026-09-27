@@ -106,16 +106,21 @@ class MicrophoneMonitor(
         prepareBluetoothRoute(input)
 
         val sampleRate = preferredSampleRate(input)
-        val inputBuffer = AudioRecord.getMinBufferSize(
+        val bluetooth = MicrophoneInputSelector.isBluetoothInput(input)
+        val minInputBuffer = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-        ).coerceAtLeast(sampleRate / 50 * 2)
-        val outputBuffer = AudioTrack.getMinBufferSize(
+        )
+        val minOutputBuffer = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-        ).coerceAtLeast(inputBuffer)
+        )
+        require(minInputBuffer > 0 && minOutputBuffer > 0) { "设备不支持麦克风采样率 $sampleRate" }
+        val chunkFrames = (sampleRate / 100).coerceAtLeast(1) // 10 ms; read in small blocks even if the native buffer is larger.
+        val inputBuffer = minInputBuffer.coerceAtLeast(if (bluetooth) sampleRate / 50 * 2 else chunkFrames * 2)
+        val outputBuffer = minOutputBuffer.coerceAtLeast(if (bluetooth) inputBuffer else chunkFrames * 2)
 
         val record = AudioRecord.Builder()
             .setAudioSource(MediaRecorder.AudioSource.MIC)
@@ -126,7 +131,7 @@ class MicrophoneMonitor(
                     .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                     .build(),
             )
-            .setBufferSizeInBytes(inputBuffer * 2)
+            .setBufferSizeInBytes(if (bluetooth) inputBuffer * 2 else inputBuffer)
             .build()
         if (input.type != AudioDeviceInfo.TYPE_BUILTIN_MIC) {
             val preferred = record.setPreferredDevice(input)
@@ -159,27 +164,43 @@ class MicrophoneMonitor(
             onStateChanged(State(false, message = "麦克风音频通道初始化失败"))
             return false
         }
+        if (!bluetooth) {
+            val effectiveFrames = track.setBufferSizeInFrames(minOutputBuffer / 2)
+            Log.i(TAG, "wired output buffer requested=${minOutputBuffer / 2} actual=$effectiveFrames frames")
+        }
 
         audioRecord = record
         audioTrack = track
         running.set(true)
         worker = thread(name = "ktv-microphone-monitor", isDaemon = true) {
-            val buffer = ShortArray(inputBuffer / 2)
+            val buffer = ShortArray(if (bluetooth) inputBuffer / 2 else chunkFrames)
             try {
-                track.play()
+                if (bluetooth) track.play()
                 record.startRecording()
-                Log.i(TAG, "microphone active device=${input.productName} sampleRate=$sampleRate buffer=$inputBuffer")
+                if (!bluetooth) track.play()
+                Log.i(TAG, "microphone active device=${input.productName} sampleRate=$sampleRate " +
+                    "recordBufferFrames=${record.bufferSizeInFrames} trackBufferFrames=${track.bufferSizeInFrames} " +
+                    "trackPerformance=${track.performanceMode} inputRoute=${record.routedDevice?.productName} " +
+                    "outputRoute=${track.routedDevice?.productName}")
                 onStateChanged(State(true, input.productName?.toString() ?: MicrophoneInputSelector.label(input.type)))
                 while (running.get()) {
                     val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
                     if (read > 0) {
-                        track.write(buffer, 0, read, AudioTrack.WRITE_BLOCKING)
+                        var written = 0
+                        while (written < read && running.get()) {
+                            val count = track.write(buffer, written, read - written, AudioTrack.WRITE_BLOCKING)
+                            if (count <= 0) throw IllegalStateException("麦克风播放写入失败：$count")
+                            written += count
+                        }
+                    } else if (read < 0) {
+                        throw IllegalStateException("麦克风录音读取失败：$read")
                     }
                 }
             } catch (error: Exception) {
                 Log.w(TAG, "microphone monitor failed", error)
                 onStateChanged(State(false, message = error.message ?: "麦克风监听失败"))
             } finally {
+                Log.i(TAG, "microphone stopped outputUnderruns=${track.underrunCount}")
                 releaseAudioObjects(record, track)
             }
         }
